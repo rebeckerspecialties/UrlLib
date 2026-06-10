@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # Fork-only mirror-base branch: no base-branch filter, so PRs targeting this branch
+  # (the CI-validation mirror of the upstream PR stack) trigger the full matrix. The
+  # upstream github-actions-ci branch keeps the family-standard `branches: [main]` filter.
   pull_request:
-    branches: [main]
 
 jobs:
   # ── Win32 ─────────────────────────────────────────────────────
