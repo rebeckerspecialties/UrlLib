@@ -2,6 +2,7 @@
 
 #include <curl/curl.h>
 #include <unistd.h>
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <cassert>
@@ -14,6 +15,46 @@ namespace
         if (code != CURLE_OK)
         {
             throw std::runtime_error{(std::stringstream{} << "CURL call failed with code (" << code << ")").str()};
+        }
+    }
+
+    // Stable symbolic names for the CURLcodes most likely to be diagnostic in the field.
+    // Restricted to constants that have existed in libcurl for a long time so this compiles
+    // against older system curl headers; anything else gets a synthesized "CURLE_<n>" token.
+    std::string curl_error_symbol(CURLcode code)
+    {
+        switch (code)
+        {
+            case CURLE_UNSUPPORTED_PROTOCOL: return "CURLE_UNSUPPORTED_PROTOCOL";
+            case CURLE_URL_MALFORMAT: return "CURLE_URL_MALFORMAT";
+            case CURLE_COULDNT_RESOLVE_PROXY: return "CURLE_COULDNT_RESOLVE_PROXY";
+            case CURLE_COULDNT_RESOLVE_HOST: return "CURLE_COULDNT_RESOLVE_HOST";
+            case CURLE_COULDNT_CONNECT: return "CURLE_COULDNT_CONNECT";
+            case CURLE_REMOTE_ACCESS_DENIED: return "CURLE_REMOTE_ACCESS_DENIED";
+            case CURLE_PARTIAL_FILE: return "CURLE_PARTIAL_FILE";
+            case CURLE_HTTP_RETURNED_ERROR: return "CURLE_HTTP_RETURNED_ERROR";
+            case CURLE_WRITE_ERROR: return "CURLE_WRITE_ERROR";
+            case CURLE_UPLOAD_FAILED: return "CURLE_UPLOAD_FAILED";
+            case CURLE_READ_ERROR: return "CURLE_READ_ERROR";
+            case CURLE_OUT_OF_MEMORY: return "CURLE_OUT_OF_MEMORY";
+            case CURLE_OPERATION_TIMEDOUT: return "CURLE_OPERATION_TIMEDOUT";
+            case CURLE_RANGE_ERROR: return "CURLE_RANGE_ERROR";
+            case CURLE_HTTP_POST_ERROR: return "CURLE_HTTP_POST_ERROR";
+            case CURLE_SSL_CONNECT_ERROR: return "CURLE_SSL_CONNECT_ERROR";
+            case CURLE_BAD_DOWNLOAD_RESUME: return "CURLE_BAD_DOWNLOAD_RESUME";
+            case CURLE_FILE_COULDNT_READ_FILE: return "CURLE_FILE_COULDNT_READ_FILE";
+            case CURLE_TOO_MANY_REDIRECTS: return "CURLE_TOO_MANY_REDIRECTS";
+            case CURLE_GOT_NOTHING: return "CURLE_GOT_NOTHING";
+            case CURLE_SEND_ERROR: return "CURLE_SEND_ERROR";
+            case CURLE_RECV_ERROR: return "CURLE_RECV_ERROR";
+            case CURLE_SSL_CERTPROBLEM: return "CURLE_SSL_CERTPROBLEM";
+            case CURLE_SSL_CIPHER: return "CURLE_SSL_CIPHER";
+            case CURLE_PEER_FAILED_VERIFICATION: return "CURLE_PEER_FAILED_VERIFICATION";
+            case CURLE_BAD_CONTENT_ENCODING: return "CURLE_BAD_CONTENT_ENCODING";
+            case CURLE_SSL_CACERT_BADFILE: return "CURLE_SSL_CACERT_BADFILE";
+            case CURLE_REMOTE_FILE_NOT_FOUND: return "CURLE_REMOTE_FILE_NOT_FOUND";
+            case CURLE_ABORTED_BY_CALLBACK: return "CURLE_ABORTED_BY_CALLBACK";
+            default: return "CURLE_" + std::to_string(static_cast<int>(code));
         }
     }
 
@@ -105,6 +146,46 @@ namespace UrlLib
                 curl_check(curl_easy_setopt(m_curl, CURLOPT_HEADERDATA, this));
                 curl_check(curl_easy_setopt(m_curl, CURLOPT_HEADERFUNCTION, HeaderCallback));
                 curl_check(curl_easy_setopt(m_curl, CURLOPT_FOLLOWLOCATION, 1L));
+                // Request-specific failure detail (host/port/path specifics) lands here during
+                // the transfer; see the error handling in PerformAsync.
+                curl_check(curl_easy_setopt(m_curl, CURLOPT_ERRORBUFFER, m_curlErrorBuffer.data()));
+
+                // HTTP/2 and HTTP/3 are TLS-only, so only opt https:// transfers into a newer
+                // version; file://, app:// (rewritten to file above), and plain http:// keep
+                // libcurl's default. The version this build supports is detected at runtime so
+                // the same binary upgrades transparently with the system curl, and every value
+                // negotiates downward when the server or transport lacks support.
+                //
+                // The compile-time guards below key off LIBCURL_VERSION_NUM (a real macro from
+                // curlver.h) rather than the CURL_HTTP_VERSION_* constants: those are enum
+                // values, invisible to the preprocessor, so `#if defined(CURL_HTTP_VERSION_3)`
+                // would silently always be false. CURL_HTTP_VERSION_2TLS arrived in 7.47.0 and
+                // CURL_HTTP_VERSION_3 in 7.66.0.
+                if (scheme != nullptr && std::strcmp(scheme, "https") == 0)
+                {
+                    const auto* versionInfo = curl_version_info(CURLVERSION_NOW);
+                    long httpVersion = CURL_HTTP_VERSION_NONE;
+#if LIBCURL_VERSION_NUM >= 0x074200 /* 7.66.0 */
+                    // HTTP/3 with fallback. The runtime >= 8.0.0 gate matters because earlier
+                    // curls treat CURL_HTTP_VERSION_3 as h3-or-fail instead of h3-with-fallback.
+                    if ((versionInfo->features & CURL_VERSION_HTTP3) && versionInfo->version_num >= 0x080000)
+                    {
+                        httpVersion = CURL_HTTP_VERSION_3;
+                    }
+                    else
+#endif
+#if LIBCURL_VERSION_NUM >= 0x072F00 /* 7.47.0 */
+                    if (versionInfo->features & CURL_VERSION_HTTP2)
+                    {
+                        // HTTP/2 over TLS via ALPN, HTTP/1.1 otherwise.
+                        httpVersion = CURL_HTTP_VERSION_2TLS;
+                    }
+#endif
+                    if (httpVersion != CURL_HTTP_VERSION_NONE)
+                    {
+                        curl_check(curl_easy_setopt(m_curl, CURLOPT_HTTP_VERSION, httpVersion));
+                    }
+                }
             }
         }
 
@@ -152,7 +233,6 @@ namespace UrlLib
             }
         }
 
-
         static void Append(std::string& string, char* buffer, size_t nitems)
         {
             string.insert(string.end(), buffer, buffer + nitems);
@@ -162,6 +242,65 @@ namespace UrlLib
         {
             auto bytes = reinterpret_cast<std::byte*>(buffer);
             byteVector.insert(byteVector.end(), bytes, bytes + nitems);   
+        }
+
+        // Drives the transfer through the libcurl *multi* interface rather than curl_easy_perform so
+        // that Abort() is observed promptly. curl_easy_perform blocks in an internal poll that, when
+        // a peer accepts the connection but sends nothing, can wait indefinitely without invoking any
+        // callback -- so a cancelled request would hang until the peer or OS gave up. Polling with a
+        // bounded timeout lets the loop re-check m_cancellationSource between waits, bounding abort
+        // latency to ~kPollTimeoutMs regardless of peer activity. Runs on the worker thread.
+        CURLcode PerformWithCancellation()
+        {
+            CURLM* multi = curl_multi_init();
+            if (multi == nullptr)
+            {
+                return CURLE_OUT_OF_MEMORY;
+            }
+            auto multiScope = gsl::finally([this, multi] {
+                curl_multi_remove_handle(multi, m_curl);
+                curl_multi_cleanup(multi);
+            });
+
+            if (curl_multi_add_handle(multi, m_curl) != CURLM_OK)
+            {
+                return CURLE_FAILED_INIT;
+            }
+
+            constexpr int kPollTimeoutMs = 100;
+            int runningHandles = 0;
+            do
+            {
+                if (m_cancellationSource.cancelled())
+                {
+                    return CURLE_ABORTED_BY_CALLBACK;
+                }
+
+                if (curl_multi_perform(multi, &runningHandles) != CURLM_OK)
+                {
+                    return CURLE_RECV_ERROR;
+                }
+
+                // Wait for socket activity but wake at least every kPollTimeoutMs so the cancellation
+                // check above runs even when the peer is idle (curl_multi_poll waits the full timeout
+                // even when there are no fds, so this never busy-loops during DNS resolution).
+                if (runningHandles != 0 && curl_multi_poll(multi, nullptr, 0, kPollTimeoutMs, nullptr) != CURLM_OK)
+                {
+                    return CURLE_RECV_ERROR;
+                }
+            } while (runningHandles != 0);
+
+            // The transfer finished; surface the per-easy-handle result code.
+            CURLcode result = CURLE_OK;
+            int messagesInQueue = 0;
+            while (CURLMsg* message = curl_multi_info_read(multi, &messagesInQueue))
+            {
+                if (message->msg == CURLMSG_DONE && message->easy_handle == m_curl)
+                {
+                    result = message->data.result;
+                }
+            }
+            return result;
         }
 
         template<typename DataT>
@@ -182,30 +321,44 @@ namespace UrlLib
 
             m_thread.emplace([this, taskCompletionSource]() mutable
             {
-                try
-                {
-                    curl_check(curl_easy_perform(m_curl));
-
-                    long codep{};
-                    curl_check(curl_easy_getinfo(m_curl, CURLINFO_RESPONSE_CODE, &codep));
-                    if (codep == 0 && m_file)
-                    {
-                        // File scheme always returns 0
-                        m_statusCode = UrlStatusCode::Ok;
-                    }
-                    else
-                    {
-                        m_statusCode = static_cast<UrlStatusCode>(codep);
-                    }
-                }
-                catch (const std::exception&)
+                m_curlErrorBuffer[0] = '\0';
+                const CURLcode performResult = PerformWithCancellation();
+                if (performResult != CURLE_OK)
                 {
                     // Retain the default status code of 0 to indicate a client side error,
                     // matching the convention of UrlRequest_UWP.cpp's catch(winrt::hresult_error)
-                    // and UrlRequest_Apple.mm's `m_url == nil` branch. Without this catch any
-                    // libcurl failure (e.g. CURLE_FILE_COULDNT_READ_FILE (37) for a missing local
-                    // `file://` or rewritten `app:///` target) would escape this std::thread and
-                    // call std::terminate.
+                    // and UrlRequest_Apple.mm's error branch -- but record what actually went
+                    // wrong so consumers can surface it. Prefer libcurl's per-request
+                    // CURLOPT_ERRORBUFFER detail (it includes host/port/path specifics, e.g.
+                    // "Failed to connect to 127.0.0.1 port 47651 ...") over the generic
+                    // curl_easy_strerror text.
+                    const char* detail = m_curlErrorBuffer[0] != '\0' ? m_curlErrorBuffer.data() : curl_easy_strerror(performResult);
+                    SetError("curl", curl_error_symbol(performResult), static_cast<int32_t>(performResult), detail);
+                }
+                else
+                {
+                    try
+                    {
+                        long codep{};
+                        curl_check(curl_easy_getinfo(m_curl, CURLINFO_RESPONSE_CODE, &codep));
+                        if (codep == 0 && m_file)
+                        {
+                            // File scheme always returns 0
+                            m_statusCode = UrlStatusCode::Ok;
+                        }
+                        else
+                        {
+                            m_statusCode = static_cast<UrlStatusCode>(codep);
+                        }
+                    }
+                    catch (const std::exception& e)
+                    {
+                        // Keep status 0 and record why. Without this catch the exception would
+                        // escape this std::thread and call std::terminate. "GetInfoFailed" is not
+                        // a real CURLcode, so it deliberately omits the "CURLE_" prefix to avoid
+                        // implying libcurl produced this code.
+                        SetError("curl", "GetInfoFailed", -1, e.what());
+                    }
                 }
 
                 taskCompletionSource.complete();
@@ -300,6 +453,7 @@ namespace UrlLib
         CURL* m_curl{};
         CURLU* m_curlu{};
         bool m_file{};
+        std::array<char, CURL_ERROR_SIZE> m_curlErrorBuffer{};
         std::optional<std::thread> m_thread{};
     };
 }

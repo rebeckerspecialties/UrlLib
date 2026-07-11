@@ -15,6 +15,59 @@ namespace
         range.length = 0x7e - range.location + 1;
         return [NSCharacterSet characterSetWithRange:range];
     }();
+
+    // Stable symbolic names for the NSURLErrorDomain codes most likely to be diagnostic in
+    // the field. Anything else gets a synthesized "NSURLError_<n>" token. (The numeric code
+    // is always reported alongside, so unmapped codes lose nothing but readability.)
+    std::string NSURLErrorSymbol(NSInteger code)
+    {
+        switch (code)
+        {
+            case NSURLErrorUnknown: return "NSURLErrorUnknown";
+            case NSURLErrorCancelled: return "NSURLErrorCancelled";
+            case NSURLErrorBadURL: return "NSURLErrorBadURL";
+            case NSURLErrorTimedOut: return "NSURLErrorTimedOut";
+            case NSURLErrorUnsupportedURL: return "NSURLErrorUnsupportedURL";
+            case NSURLErrorCannotFindHost: return "NSURLErrorCannotFindHost";
+            case NSURLErrorCannotConnectToHost: return "NSURLErrorCannotConnectToHost";
+            case NSURLErrorNetworkConnectionLost: return "NSURLErrorNetworkConnectionLost";
+            case NSURLErrorDNSLookupFailed: return "NSURLErrorDNSLookupFailed";
+            case NSURLErrorHTTPTooManyRedirects: return "NSURLErrorHTTPTooManyRedirects";
+            case NSURLErrorResourceUnavailable: return "NSURLErrorResourceUnavailable";
+            case NSURLErrorNotConnectedToInternet: return "NSURLErrorNotConnectedToInternet";
+            case NSURLErrorRedirectToNonExistentLocation: return "NSURLErrorRedirectToNonExistentLocation";
+            case NSURLErrorBadServerResponse: return "NSURLErrorBadServerResponse";
+            case NSURLErrorUserCancelledAuthentication: return "NSURLErrorUserCancelledAuthentication";
+            case NSURLErrorUserAuthenticationRequired: return "NSURLErrorUserAuthenticationRequired";
+            case NSURLErrorZeroByteResource: return "NSURLErrorZeroByteResource";
+            case NSURLErrorCannotDecodeRawData: return "NSURLErrorCannotDecodeRawData";
+            case NSURLErrorCannotDecodeContentData: return "NSURLErrorCannotDecodeContentData";
+            case NSURLErrorCannotParseResponse: return "NSURLErrorCannotParseResponse";
+            case NSURLErrorAppTransportSecurityRequiresSecureConnection: return "NSURLErrorAppTransportSecurityRequiresSecureConnection";
+            case NSURLErrorFileDoesNotExist: return "NSURLErrorFileDoesNotExist";
+            case NSURLErrorFileIsDirectory: return "NSURLErrorFileIsDirectory";
+            case NSURLErrorNoPermissionsToReadFile: return "NSURLErrorNoPermissionsToReadFile";
+            case NSURLErrorDataLengthExceedsMaximum: return "NSURLErrorDataLengthExceedsMaximum";
+            case NSURLErrorSecureConnectionFailed: return "NSURLErrorSecureConnectionFailed";
+            case NSURLErrorServerCertificateHasBadDate: return "NSURLErrorServerCertificateHasBadDate";
+            case NSURLErrorServerCertificateUntrusted: return "NSURLErrorServerCertificateUntrusted";
+            case NSURLErrorServerCertificateHasUnknownRoot: return "NSURLErrorServerCertificateHasUnknownRoot";
+            case NSURLErrorServerCertificateNotYetValid: return "NSURLErrorServerCertificateNotYetValid";
+            case NSURLErrorClientCertificateRejected: return "NSURLErrorClientCertificateRejected";
+            case NSURLErrorClientCertificateRequired: return "NSURLErrorClientCertificateRequired";
+            case NSURLErrorCannotLoadFromNetwork: return "NSURLErrorCannotLoadFromNetwork";
+            default: return "NSURLError_" + std::to_string(static_cast<long>(code));
+        }
+    }
+
+    // Safely convert an NSString* to std::string. [nil UTF8String] (and, rarely, a UTF-8
+    // encoding failure) yields a null pointer, and std::string{nullptr} is undefined
+    // behavior, so fall back to an empty string.
+    std::string ToStdString(NSString* string)
+    {
+        const char* utf8{[string UTF8String]};
+        return utf8 != nullptr ? std::string{utf8} : std::string{};
+    }
 }
 
 namespace UrlLib
@@ -31,7 +84,7 @@ namespace UrlLib
             m_url = [NSURL URLWithString:[[NSString stringWithUTF8String:url.data()] stringByAddingPercentEncodingWithAllowedCharacters:URLAllowedCharacterSet]];
             if (!m_url || !m_url.scheme)
             {
-                throw std::runtime_error{"URL does not have a valid scheme"};
+                throw std::runtime_error{"URL does not have a valid scheme: '" + url + "'"};
             }
             NSString* scheme{m_url.scheme};
             if ([scheme isEqual:@"app"])
@@ -42,7 +95,9 @@ namespace UrlLib
                     // No bundled resource at this path. Don't throw -- let SendAsync's existing
                     // `if (m_url == nil)` branch complete the task and retain the default status
                     // code of 0 to indicate a client side error. This matches Win32 / UWP / Unix
-                    // semantics for missing local files.
+                    // semantics for missing local files. Record why so ErrorString() consumers
+                    // can distinguish a missing bundled asset from a network failure.
+                    SetError("urllib", "AppResourceNotFound", 0, "no bundled resource for '" + url + "'");
                     m_url = nil;
                     return;
                 }
@@ -77,6 +132,28 @@ namespace UrlLib
                 mutableRequest.HTTPBody = requestBodyData;
             }
 
+            // HTTP/3 (QUIC) is TLS-only, so restrict the opt-in to https:// (app:// has been
+            // rewritten to file:// by now, and file:///http:// gain nothing). HTTP/2 has been
+            // automatic via ALPN since iOS 9 / macOS 10.11 and needs no opt-in.
+            //
+            // The #if guards compilation on the *SDK* version: assumesHTTP3Capable was added in
+            // the macOS 11.3 / iOS 14.5 SDKs, and @available only gates the runtime deployment
+            // target -- referencing the property against an older SDK is a hard compile error.
+            // Together: #if keeps it out of older-SDK builds, @available keeps it off older OSes.
+            if ([m_url.scheme caseInsensitiveCompare:@"https"] == NSOrderedSame)
+            {
+#if (defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 110300) || \
+    (defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 140500)
+                if (@available(macOS 11.3, iOS 14.5, *))
+                {
+                    // Attempt h3 for this request directly rather than waiting to learn support
+                    // from a prior response's Alt-Svc header; the stack races QUIC against TCP
+                    // and falls back to h2/h1.1 when the server lacks h3.
+                    mutableRequest.assumesHTTP3Capable = YES;
+                }
+#endif
+            }
+
             request = [mutableRequest copy];
 
             __block arcana::task_completion_source<void, std::exception_ptr> taskCompletionSource{};
@@ -85,8 +162,47 @@ namespace UrlLib
             {
                 if (error != nil)
                 {
-                    // Complete the task, but retain the default status code of 0 to indicate a client side error.
-                    // TODO: Consider logging or otherwise exposing the error message in some way via: [[error localizedDescription] UTF8String]
+                    // Complete the task, but retain the default status code of 0 to indicate a
+                    // client side error -- and record what actually went wrong so consumers can
+                    // surface it. NSURLErrorDomain codes get stable symbols; other domains pass
+                    // through verbatim. One level of NSUnderlyingErrorKey is appended because
+                    // that is where CFNetwork/POSIX specifics (e.g. "Connection refused") live.
+                    // Note the human-readable detail is localized by the OS; the domain, symbol,
+                    // and numeric code are the stable, filterable parts.
+                    std::string domain{"nsurl"};
+                    std::string symbol;
+                    if ([error.domain isEqualToString:NSURLErrorDomain])
+                    {
+                        symbol = NSURLErrorSymbol(error.code);
+                    }
+                    else
+                    {
+                        domain = ToStdString(error.domain);
+                        symbol = "NSError_" + std::to_string(static_cast<long>(error.code));
+                    }
+
+                    std::string detail{ToStdString([error localizedDescription])};
+
+                    // Walk the underlying-error chain (bounded), appending only levels that carry
+                    // a different numeric code, so POSIX-level specifics like "Connection refused"
+                    // surface while the kCFErrorDomainCFNetwork echo of the same code (Apple keeps
+                    // NSURL and CFNetwork codes aligned) is skipped.
+                    NSInteger previousCode = error.code;
+                    NSError* underlying = error.userInfo[NSUnderlyingErrorKey];
+                    for (int depth = 0; underlying != nil && depth < 3; ++depth)
+                    {
+                        if (underlying.code != previousCode)
+                        {
+                            detail += " <- ";
+                            detail += ToStdString(underlying.domain);
+                            detail += "(" + std::to_string(static_cast<long>(underlying.code)) + "): ";
+                            detail += ToStdString([underlying localizedDescription]);
+                        }
+                        previousCode = underlying.code;
+                        underlying = underlying.userInfo[NSUnderlyingErrorKey];
+                    }
+
+                    SetError(domain, symbol, static_cast<int32_t>(error.code), detail);
                     taskCompletionSource.complete();
                     return;
                 }
@@ -134,6 +250,23 @@ namespace UrlLib
             NSURLSessionDataTask* task{[session dataTaskWithRequest:request completionHandler:completionHandler]};
             [task resume];
 
+            // Observe Abort(): NSURLSession runs the request asynchronously and does not watch
+            // m_cancellationSource on its own. Cancelling the task makes its completion handler fire
+            // with NSURLErrorCancelled (recorded as the transport error). The task is captured
+            // *weakly* so the listener does not keep a finished task alive -- NSURLSession releases
+            // the task once its completion handler has run, after which a late Abort() loads a nil
+            // strong reference and the -cancel is a safe no-op. The listener fires synchronously if
+            // the request was already aborted; the ticket is reset on each send and released before
+            // m_cancellationSource (a base member) is destroyed. emplace() (not assignment) is used
+            // because arcana::cancellation::ticket is a move-only final_action whose assignment
+            // operators are deleted, so std::optional::operator= would not compile; emplace destroys
+            // any prior ticket (releasing the previous send's listener) and move-constructs the new one.
+            __weak NSURLSessionDataTask* weakTask = task;
+            m_cancellationTicket.emplace(m_cancellationSource.add_listener([weakTask]() {
+                NSURLSessionDataTask* strongTask = weakTask;
+                [strongTask cancel];
+            }));
+
             return taskCompletionSource.as_task();
         }
 
@@ -150,6 +283,7 @@ namespace UrlLib
     private:
         NSURL* m_url{};
         NSData* m_responseBuffer{};
+        std::optional<arcana::cancellation::ticket> m_cancellationTicket{};
     };
 }
 
